@@ -58,13 +58,14 @@ public class FortifyClient {
 	 * @param token
 	 *            e.g. the AuditToken
 	 */
-	public void init(String uri, String token) throws ApiException {
-		apiClientWrapper = new ApiClientWrapper(uri, token);
+	public void init(String uri, String token, Integer connectTimeoutSeconds, Integer readTimeoutSeconds,
+					 Integer writeTimeoutSeconds) throws ApiException {
+		apiClientWrapper = new ApiClientWrapper(uri, token, connectTimeoutSeconds, readTimeoutSeconds, writeTimeoutSeconds);
 	}
 
-	public void init(String uri, String token, String proxyHost, int proxyPort, String proxyUsername,
-					 String proxyPassword) throws ApiException {
-		init(uri, token);
+	public void init(String uri, String token, String proxyHost, int proxyPort, String proxyUsername, String proxyPassword,
+					 Integer connectTimeoutSeconds, Integer readTimeoutSeconds, Integer writeTimeoutSeconds) throws ApiException {
+		init(uri, token, connectTimeoutSeconds, readTimeoutSeconds, writeTimeoutSeconds);
 		apiClientWrapper.setProxy(proxyHost, proxyPort, proxyUsername, proxyPassword);
 	}
 
@@ -322,6 +323,19 @@ public class FortifyClient {
 		addAllFolderInfo(result, allTotalCount, allNewIssuesCount); // add info for "All" folder to result
 
 		return result;
+	}
+
+	/**
+	 * Retrieves application version id from SSC by given application name and application version name.
+	 *
+	 * @param appName
+	 * @param appVersionName
+	 * @return application version id
+	 * @throws ApiException
+	 */
+	public Long getProjectVersionId(String appName, String appVersionName) throws ApiException {
+		final Long applicationId = apiClientWrapper.getApplicationId(appName);
+		return apiClientWrapper.getVersionForApplication(applicationId, appVersionName);
 	}
 
 	private void addAllFolderInfo(Map<String, List<String>> result, int allTotalCount, int allNewIssuesCount) {

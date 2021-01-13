@@ -242,6 +242,10 @@ public class FortifyPlugin extends Recorder {
 		return getAnalysisRunType() && analysisRunType.value.equals("local");
 	}
 
+	public boolean isUploadOnly() {
+		return getAnalysisRunType() && analysisRunType.value.equals("uploadOnly");
+	}
+
 	public boolean isTranslationDebug() { return getAnalysisRunType() && analysisRunType.isTranslationDebug(); }
 	public boolean isTranslationVerbose() { return getAnalysisRunType() && analysisRunType.isTranslationVerbose(); }
 
@@ -528,12 +532,16 @@ public class FortifyPlugin extends Recorder {
 		return uploadSSC == null ? null : uploadSSC.getPollingInterval();
 	}
 
+	public String getTimeout() {
+		return getUploadSSC() ? analysisRunType.getUploadSSC().getTimeout() : "";
+	}
+
 	public String getPollingInterval() {
 		return getUploadSSC() ? analysisRunType.getUploadSSC().getPollingInterval() : "";
 	}
 
 	public boolean getRemoteOptionalConfig() {
-		return !isLocal() && analysisRunType.getRemoteOptionalConfig() != null;
+		return !isLocal() && !isUploadOnly() && analysisRunType.getRemoteOptionalConfig() != null;
 	}
 
 	public String getSensorPoolUUID() {
@@ -630,6 +638,8 @@ public class FortifyPlugin extends Recorder {
 			runMixed(build, launcher, listener);
 		} else if (isLocal()) { // Local Translation
 			runLocal(build, launcher, listener);
+		} else if (isUploadOnly()) {
+			runUploadOnly(build, launcher, listener);
 		}
 
 		return true;
@@ -709,11 +719,25 @@ public class FortifyPlugin extends Recorder {
 			upload.setFailureCriteria(getSearchCondition());
 			upload.setFilterSet(getFilterSet());
 			upload.setResultsFile(getScanFile());
+			upload.setTimeout(getTimeout());
 			upload.setPollingInterval(getPollingInterval());
 
 			upload.perform(build, launcher, listener);
 		}
 
+	}
+
+	private void runUploadOnly(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws IOException, InterruptedException {
+		PrintStream log = listener.getLogger();
+		log.println("Running upload-only step.");
+
+		FortifyUpload upload = new FortifyUpload(false, getAppName(), getAppVersion());
+		upload.setFailureCriteria(getSearchCondition());
+		upload.setFilterSet(getFilterSet());
+		upload.setResultsFile(getScanFile());
+		upload.setPollingInterval(getPollingInterval());
+
+		upload.perform(build, launcher, listener);
 	}
 
 	private void performLocalTranslation(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws IOException, InterruptedException {
@@ -811,7 +835,7 @@ public class FortifyPlugin extends Recorder {
 					boolean useProxy = DESCRIPTOR.getUseProxy();
 					String proxyUrl = DESCRIPTOR.getProxyUrl();
 					if (!useProxy || StringUtils.isEmpty(proxyUrl)) {
-						client.init(url, token);
+						client.init(url, token, DESCRIPTOR.getConnectTimeout(), DESCRIPTOR.getReadTimeout(), DESCRIPTOR.getWriteTimeout());
 					} else {
 						String[] proxyUrlSplit = proxyUrl.split(":");
 						String proxyHost = proxyUrlSplit[0];
@@ -822,8 +846,8 @@ public class FortifyPlugin extends Recorder {
 							} catch (NumberFormatException nfe) {
 							}
 						}
-						client.init(url, token, proxyHost, proxyPort, DESCRIPTOR.getProxyUsername(),
-								DESCRIPTOR.getProxyPassword());
+						client.init(url, token, proxyHost, proxyPort, DESCRIPTOR.getProxyUsername(), DESCRIPTOR.getProxyPassword(),
+								DESCRIPTOR.getConnectTimeout(), DESCRIPTOR.getReadTimeout(), DESCRIPTOR.getWriteTimeout());
 					}
 				}
 				return cmd.runWith(client);
@@ -858,6 +882,15 @@ public class FortifyPlugin extends Recorder {
 
 		/** Number of issues to be displayed per page in breakdown table */
 		private Integer breakdownPageSize;
+
+		/** SSC connection timeout */
+		private Integer connectTimeout;
+
+		/** SSC read timeout */
+		private Integer readTimeout;
+
+		/** SSC write timeout */
+		private Integer writeTimeout;
 
 		/** List of Issue Templates obtained from SSC */
 		private List<ProjectTemplateBean> projTemplateList = Collections.emptyList();
@@ -923,6 +956,18 @@ public class FortifyPlugin extends Recorder {
 
 		public Integer getBreakdownPageSize() {
 			return breakdownPageSize;
+		}
+
+		public Integer getConnectTimeout() {
+			return connectTimeout;
+		}
+
+		public Integer getReadTimeout() {
+			return readTimeout;
+		}
+
+		public Integer getWriteTimeout() {
+			return writeTimeout;
 		}
 
 		public String getCtrlUrl() { return ctrlUrl; }
@@ -1027,6 +1072,23 @@ public class FortifyPlugin extends Recorder {
 
 		public FormValidation doCheckProjectVersion(@QueryParameter String value) {
 			return FormValidation.ok();
+		}
+
+		public FormValidation doCheckTimeout(@QueryParameter String value) {
+			if (StringUtils.isBlank(value)) {
+				return FormValidation.ok();
+			} else {
+				try {
+					int x = Integer.parseInt(value);
+					if (x >= 0 && x <= 10080) {
+						return FormValidation.ok();
+					} else {
+						return FormValidation.error("Timeout must be in the range of 0 to 10080");
+					}
+				} catch (NumberFormatException e) {
+					return FormValidation.error("Timeout is invalid");
+				}
+			}
 		}
 
 		public FormValidation doCheckPollingInterval(@QueryParameter String value) {
@@ -1444,11 +1506,11 @@ public class FortifyPlugin extends Recorder {
 		private boolean isSettingUpdated = false;
 
 		@Override
-		public boolean configure(StaplerRequest req, JSONObject o) throws FormException {
+		public boolean configure(StaplerRequest req, JSONObject jsonObject) throws FormException {
 			// to persist global configuration information,
 			// set that to properties and call save().
 			try {
-				url = o.getString("url").trim();
+				url = jsonObject.getString("url").trim();
 				checkUrlValue(url);
 			} catch (JSONException e) {
 				System.out.println("Cannot restore 'URL' property. Will use default (empty) values.");
@@ -1459,7 +1521,7 @@ public class FortifyPlugin extends Recorder {
 			}
 			JSONObject useProxy = null;
 			try {
-				useProxy = o.getJSONObject("useProxy");
+				useProxy = jsonObject.getJSONObject("useProxy");
 			} catch (JSONException e) {
 			}
 			if (useProxy == null || useProxy.isNullObject()) {
@@ -1501,7 +1563,7 @@ public class FortifyPlugin extends Recorder {
 				}
 			}
 			try {
-				String tokenParam = o.getString("token").trim();
+				String tokenParam = jsonObject.getString("token").trim();
 				token = tokenParam.isEmpty() ? null : Secret.fromString(tokenParam);
 			} catch (JSONException e) {
 				System.out.println("Cannot restore 'Authentication Token' property. Will use default (empty) values.");
@@ -1509,14 +1571,14 @@ public class FortifyPlugin extends Recorder {
 			}
 
 			try {
-				projectTemplate = o.getString("projectTemplate").trim();
+				projectTemplate = jsonObject.getString("projectTemplate").trim();
 			} catch (JSONException e) {
 				System.out.println("Cannot restore 'Issue template' property. Will use default (empty) values.");
 				projectTemplate = null;
 			}
 
 			try {
-				String pageSizeString = o.getString("breakdownPageSize");
+				String pageSizeString = jsonObject.getString("breakdownPageSize");
 				if (pageSizeString != null && pageSizeString.trim().length() > 0) {
 					breakdownPageSize = Integer.parseInt(pageSizeString.trim());
 				} else {
@@ -1528,7 +1590,43 @@ public class FortifyPlugin extends Recorder {
 			}
 
 			try {
-				ctrlUrl = o.getString("ctrlUrl").trim();
+				String connectTimeoutString = jsonObject.getString("connectTimeout");
+				if (connectTimeoutString != null && connectTimeoutString.trim().length() > 0) {
+					connectTimeout = Integer.parseInt(connectTimeoutString.trim());
+				} else {
+					connectTimeout = null;
+				}
+			} catch (NumberFormatException | JSONException e) {
+				System.out.println("Cannot restore 'Connection timeout' property.");
+				connectTimeout = null;
+			}
+
+			try {
+				String readTimeoutString = jsonObject.getString("readTimeout");
+				if (readTimeoutString != null && readTimeoutString.trim().length() > 0) {
+					readTimeout = Integer.parseInt(readTimeoutString.trim());
+				} else {
+					readTimeout = null;
+				}
+			} catch (NumberFormatException | JSONException e) {
+				System.out.println("Cannot restore 'Read timeout' property.");
+				readTimeout = null;
+			}
+
+			try {
+				String writeTimeoutString = jsonObject.getString("writeTimeout");
+				if (writeTimeoutString != null && writeTimeoutString.trim().length() > 0) {
+					writeTimeout = Integer.parseInt(writeTimeoutString.trim());
+				} else {
+					writeTimeout = null;
+				}
+			} catch (NumberFormatException | JSONException e) {
+				System.out.println("Cannot restore 'Write timeout' property.");
+				writeTimeout = null;
+			}
+
+			try {
+				ctrlUrl = jsonObject.getString("ctrlUrl").trim();
 				checkCtrlUrlValue(ctrlUrl);
 			} catch (JSONException e) {
 				System.out.println("Cannot restore 'CTRLURL' property. Will use default (empty) values.");
@@ -1539,7 +1637,7 @@ public class FortifyPlugin extends Recorder {
 			}
 
 			try {
-				String ctrlTokenParam = o.getString("ctrlToken").trim();
+				String ctrlTokenParam = jsonObject.getString("ctrlToken").trim();
 				ctrlToken = ctrlTokenParam.isEmpty() ? null : Secret.fromString(ctrlTokenParam);
 			} catch (JSONException e) {
 				System.out.println("Cannot restore 'Controller token' property. Will use default (empty) values.");
@@ -1548,7 +1646,7 @@ public class FortifyPlugin extends Recorder {
 
 			save();
 			isSettingUpdated = true;
-			return super.configure(req, o);
+			return super.configure(req, jsonObject);
 		}
 
 		public boolean isSettingUpdated() {
@@ -1611,7 +1709,7 @@ public class FortifyPlugin extends Recorder {
 		/**
 		 * Get Issue template list from SSC via WS <br/>
 		 * Basically only for global.jelly pull down menu
-		 * 
+		 *
 		 * @return A list of Issue template and ID
 		 * @throws ApiException
 		 */
@@ -1733,6 +1831,7 @@ public class FortifyPlugin extends Recorder {
 		private String appVersion;
 		private String filterSet;
 		private String searchCondition;
+		private String timeout;
 		private String pollingInterval;
 
 		@DataBoundConstructor
@@ -1742,11 +1841,13 @@ public class FortifyPlugin extends Recorder {
 		}
 
 		@Deprecated
-		public UploadSSCBlock(String projectName, String projectVersion, String filterSet, String searchCondition, String pollingInterval) {
+		public UploadSSCBlock(String projectName, String projectVersion, String filterSet, String searchCondition,
+							  String timeout, String pollingInterval) {
 			this.projectName = projectName != null ? projectName.trim() : "";
 			this.projectVersion = projectName != null ? projectVersion.trim() : "";
 			this.filterSet = filterSet != null ? filterSet.trim() : "";
 			this.searchCondition = searchCondition != null ? searchCondition.trim() : "";
+			this.timeout = timeout != null ? timeout.trim() : "";
 			this.pollingInterval = pollingInterval != null ? pollingInterval.trim() : "";
 		}
 
@@ -1790,6 +1891,15 @@ public class FortifyPlugin extends Recorder {
 		}
 		@DataBoundSetter
 		public void setSearchCondition(String searchCondition) { this.searchCondition = searchCondition; }
+
+		public String getTimeout() {
+			return timeout;
+		}
+
+		@DataBoundSetter
+		public void setTimeout(String timeout) {
+			this.timeout = timeout;
+		}
 
 		public String getPollingInterval() {
 			return pollingInterval;

@@ -81,6 +81,7 @@ public class FortifyUpload extends FortifyStep {
 	private String failureCriteria;
 	private String appName;
 	private String appVersion;
+	private String timeout;
 	private String pollingInterval;
 
 	public FortifyUpload(boolean isPipeline, String appName, String appVersion) {
@@ -130,6 +131,15 @@ public class FortifyUpload extends FortifyStep {
 		return failureCriteria;
 	}
 
+	public String getTimeout() {
+		return timeout;
+	}
+
+	@DataBoundSetter
+	public void setTimeout(String timeout) {
+		this.timeout = timeout;
+	}
+
 	@DataBoundSetter
 	public void setPollingInterval(String pollingInterval) {
 		this.pollingInterval = pollingInterval;
@@ -164,6 +174,17 @@ public class FortifyUpload extends FortifyStep {
 		return resolve(getFailureCriteria(), listener);
 	}
 
+	public Integer getResolvedTimeout(TaskListener listener) {
+		if (getTimeout() != null) {
+			try {
+				return Integer.parseInt(resolve(String.valueOf(getTimeout()), listener));
+			} catch (NumberFormatException e) {
+				return null;
+			}
+		}
+		return null;
+	}
+
 	public Integer getResolvedPollingInterval(TaskListener listener) {
 		if (getPollingInterval() != null) {
 			try {
@@ -192,7 +213,7 @@ public class FortifyUpload extends FortifyStep {
 		RemoteService service = new RemoteService(getResolvedFpr(listener));
 		FPRSummary summary = workspace.act(service);
 		Long artifactId = uploadToSSC(summary, workspace, listener);
-		pollFprProcessing(artifactId, listener);
+		pollFprProcessing(run, artifactId, listener);
 
 		log.println("Retrieving build statistics from SSC");
 		calculateFprStatistics(summary, listener);
@@ -260,7 +281,8 @@ public class FortifyUpload extends FortifyStep {
 		if (!StringUtils.isBlank(getResolvedAppName(listener)) && !StringUtils.isBlank(getResolvedAppVersion(listener))
 				&& FortifyPlugin.DESCRIPTOR.canUploadToSsc()) {
 			// the FPR may be in remote slave, we need to call launcher to do this for me
-			log.printf("Uploading FPR to SSC at %s%n", FortifyPlugin.DESCRIPTOR.getUrl());
+			log.printf("Uploading FPR to SSC at %s to application '%s' and application version '%s'%n",
+					FortifyPlugin.DESCRIPTOR.getUrl(), getResolvedAppName(listener), getResolvedAppVersion(listener));
 			try {
 				final Long projectId = createNewOrGetProject(listener);
 				final File fpr = localFPR;
@@ -301,9 +323,14 @@ public class FortifyUpload extends FortifyStep {
 		}
 	}
 
-	private void pollFprProcessing(Long artifactId, TaskListener listener) throws IOException {
+	private void pollFprProcessing(Run<?, ?> run, Long artifactId, TaskListener listener) throws IOException {
 		PrintStream log = listener.getLogger();
 		boolean isProcessingComplete = false;
+
+		int timeoutInMinutes = (getResolvedTimeout(listener) != null) ? getResolvedTimeout(listener) : 0;
+		int timeoutInMillis = timeoutInMinutes * 60 * 1000;
+		long timeoutAfter = System.currentTimeMillis() + timeoutInMillis;
+
 		while (!isProcessingComplete) {
 			int sleep = (getResolvedPollingInterval(listener) != null) ? getResolvedPollingInterval(listener) : 1;
 			log.printf("Sleep for %d minute(s)%n", sleep);
@@ -352,7 +379,46 @@ public class FortifyUpload extends FortifyStep {
 				t.printStackTrace(log);
 				throw new AbortException("Failed to retrieve artifact statistics from SSC");
 			}
+
+			if (timeoutInMinutes != 0) {
+				long diff = timeoutAfter - System.currentTimeMillis();
+				if (diff <= 0) {
+					setBuildUncompleted(run, log, timeoutInMinutes);
+				}
+			}
 		}
+	}
+
+	private void setBuildUncompleted(Run<?, ?> run, PrintStream log, int timeoutInMinutes) throws IOException {
+		final long projectVersionId = getProjectVersionId(log);
+		final String appArtifactsURL = getAppArtifactsURL(projectVersionId);
+
+		run.setResult(Result.NOT_BUILT);
+		run.setDescription("A timeout has been reached when checking SSC for status of artifacts, this could happen " +
+				"on long running processing jobs and does not mean that the build failed. You can check the status in SSC here: " +
+				appArtifactsURL);
+		throw new AbortException("Timeout of " + timeoutInMinutes + " minute(s) is reached.");
+	}
+
+	private long getProjectVersionId(PrintStream log) throws AbortException {
+		long projectVersionId;
+		try {
+			projectVersionId = runWithFortifyClient(FortifyPlugin.DESCRIPTOR.getToken(),
+					new FortifyClient.Command<Long>() {
+						@Override
+						public Long runWith(FortifyClient client) throws Exception {
+							return client.getProjectVersionId(appName, appVersion);
+						}
+					});
+		} catch (Exception e) {
+			e.printStackTrace(log);
+			throw new AbortException("Error occurred during FPR polling: " + e.getMessage());
+		}
+		return projectVersionId;
+	}
+
+	private String getAppArtifactsURL(Long projectVersionId) {
+		return FortifyPlugin.DESCRIPTOR.getUrl() + "/html/ssc/version/" + projectVersionId + "/artifacts";
 	}
 
 	private void calculateFprStatistics(FPRSummary summary, TaskListener listener) {
@@ -760,7 +826,8 @@ public class FortifyUpload extends FortifyStep {
 					boolean useProxy = FortifyPlugin.DESCRIPTOR.getUseProxy();
 					String proxyUrl = FortifyPlugin.DESCRIPTOR.getProxyUrl();
 					if (!useProxy || StringUtils.isEmpty(proxyUrl)) {
-						client.init(url, token);
+						client.init(url, token, FortifyPlugin.DESCRIPTOR.getConnectTimeout(),
+								FortifyPlugin.DESCRIPTOR.getReadTimeout(), FortifyPlugin.DESCRIPTOR.getWriteTimeout());
 					} else {
 						String[] proxyUrlSplit = proxyUrl.split(":");
 						String proxyHost = proxyUrlSplit[0];
@@ -771,8 +838,10 @@ public class FortifyUpload extends FortifyStep {
 							} catch (NumberFormatException nfe) {
 							}
 						}
-						client.init(url, token, proxyHost, proxyPort, FortifyPlugin.DESCRIPTOR.getProxyUsername(),
-								FortifyPlugin.DESCRIPTOR.getProxyPassword());
+						client.init(url, token, proxyHost, proxyPort,
+								FortifyPlugin.DESCRIPTOR.getProxyUsername(), FortifyPlugin.DESCRIPTOR.getProxyPassword(),
+								FortifyPlugin.DESCRIPTOR.getConnectTimeout(), FortifyPlugin.DESCRIPTOR.getReadTimeout(),
+								FortifyPlugin.DESCRIPTOR.getWriteTimeout());
 					}
 					/*boolean useProxy = Jenkins.get().proxy != null;
 					if (!useProxy) {
